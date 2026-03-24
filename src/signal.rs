@@ -164,25 +164,36 @@ impl<T> Signal<T> {
             fence(Ordering::Acquire);
             return v == UNLOCKED;
         }
-        match self.state.compare_exchange(
-            LOCKED,
-            LOCKED_STARVATION,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => loop {
-                let v = self.state.load(Ordering::Relaxed);
-                if v < LOCKED {
-                    fence(Ordering::Acquire);
-                    return v == UNLOCKED;
+        match &self.waker {
+            KanalWaker::Sync(waker) => {
+                // Register the current thread so wake() can unpark us.
+                // Must happen before the CAS to LOCKED_STARVATION, matching wait().
+                unsafe {
+                    *waker.get() = Some(std::thread::current());
                 }
-                let now = Instant::now();
-                if now >= until {
-                    return self.state.load(Ordering::Acquire) == UNLOCKED;
+                match self.state.compare_exchange(
+                    LOCKED,
+                    LOCKED_STARVATION,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => loop {
+                        let v = self.state.load(Ordering::Relaxed);
+                        if v < LOCKED {
+                            fence(Ordering::Acquire);
+                            return v == UNLOCKED;
+                        }
+                        let now = Instant::now();
+                        if now >= until {
+                            return self.state.load(Ordering::Acquire) == UNLOCKED;
+                        }
+                        std::thread::park_timeout(until - now);
+                    },
+                    Err(v) => v == UNLOCKED,
                 }
-                std::thread::park_timeout(until - now);
-            },
-            Err(v) => v == UNLOCKED,
+            }
+            #[cfg(feature = "async")]
+            KanalWaker::None | KanalWaker::Async(_) => unreachable!(),
         }
     }
 
@@ -229,6 +240,10 @@ impl<T> Signal<T> {
                     .compare_exchange(LOCKED, state, Ordering::Release, Ordering::Acquire)
                     .is_err()
                 {
+                    debug_assert!(
+                        (*waker.get()).is_some(),
+                        "wake() called on LOCKED_STARVATION signal with no registered thread"
+                    );
                     if let Some(thread) = (*waker.get()).as_ref() {
                         let thread = thread.clone();
                         (*this).state.store(state, Ordering::Release);
