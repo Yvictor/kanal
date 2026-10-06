@@ -239,6 +239,18 @@ impl<T> Signal<T> {
         self.waker = KanalWaker::Async(waker.clone())
     }
 
+    /// Replaces the registered async waker and returns the previous one.
+    /// Only call this while the signal is still in the wait list and the
+    /// channel lock is held: a peer reads the waker as soon as it took the
+    /// signal. Drop the returned waker after releasing the lock, as dropping
+    /// a waker may run arbitrary code.
+    #[inline(always)]
+    #[cfg(feature = "async")]
+    #[must_use]
+    pub(crate) fn replace_waker(&mut self, waker: &Waker) -> KanalWaker {
+        core::mem::replace(&mut self.waker, KanalWaker::Async(waker.clone()))
+    }
+
     /// Set pointer to data for receiving or sending
     #[inline(always)]
     #[cfg(feature = "async")]

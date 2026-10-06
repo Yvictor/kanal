@@ -1496,3 +1496,81 @@ fn timeout_race_stress_many_stalled_handoffs_lose_and_duplicate_nothing() {
     seen.sort_unstable();
     assert_eq!(seen, (0..PRODUCERS * PER_PRODUCER).collect::<Vec<_>>());
 }
+
+// ---------------------------------------------------------------------------
+// Repolling a queued future with a different waker
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "async")]
+mod async_waker {
+    use super::async_support::*;
+    use super::*;
+    use core::task::Poll;
+
+    /// The latest waker must be the one woken once the peer completes the
+    /// signal.
+    #[test]
+    fn timeout_race_repolled_receive_future_wakes_the_latest_waker() {
+        let probe = Big::probe();
+        let (tx, rx) = bounded_async::<Big>(0);
+        let mut fut = Box::pin(rx.recv());
+        let (old, old_wakes) = counting_waker();
+        let (new, new_wakes) = counting_waker();
+        assert!(poll_once(fut.as_mut(), &old).is_pending());
+        assert!(poll_once(fut.as_mut(), &new).is_pending());
+        assert_eq!(tx.try_send(Big::make(&probe, 41)), Ok(true));
+        assert_eq!(new_wakes.0.load(SeqCst), 1, "latest waker not woken");
+        assert_eq!(old_wakes.0.load(SeqCst), 0, "stale waker woken");
+        match poll_once(fut.as_mut(), &new) {
+            Poll::Ready(Ok(v)) => assert_eq!(v.id, 41),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(probe.drops(), 1);
+    }
+
+    /// A peer that takes the signal while the future replaces its waker must
+    /// not be able to see (and wake) the old waker after the future decided
+    /// the signal was still queued. The peer runs inside the window through
+    /// the `WakerSwap` hook, using the non-blocking lock attempt: it may only
+    /// succeed if the queue check and the waker swap are not atomic.
+    #[test]
+    fn timeout_race_receive_future_waker_swap_is_atomic_with_queue_check() {
+        let probe = Big::probe();
+        let (tx, rx) = bounded_async::<Big>(0);
+        let mut fut = Box::pin(rx.recv());
+        let (old, old_wakes) = counting_waker();
+        let (new, new_wakes) = counting_waker();
+        assert!(poll_once(fut.as_mut(), &old).is_pending());
+        let item = Rc::new(RefCell::new(Some(Big::make(&probe, 43))));
+        let (hook_tx, hook_item) = (tx.clone_sync(), item.clone());
+        let hook = test_hooks::set(move |point| {
+            if point == Hook::WakerSwap {
+                let _ = hook_tx.try_send_option_realtime(&mut hook_item.borrow_mut());
+            }
+            None
+        });
+        let polled = poll_once(fut.as_mut(), &new);
+        drop(hook);
+        let got = match polled {
+            Poll::Ready(r) => r.unwrap(),
+            Poll::Pending => {
+                if item.borrow().is_some() {
+                    assert_eq!(tx.try_send_option(&mut item.borrow_mut()), Ok(true));
+                }
+                assert_eq!(
+                    new_wakes.0.load(SeqCst),
+                    1,
+                    "value delivered but only the replaced waker was woken"
+                );
+                match poll_once(fut.as_mut(), &new) {
+                    Poll::Ready(r) => r.unwrap(),
+                    Poll::Pending => panic!("woken but not ready"),
+                }
+            }
+        };
+        assert_eq!(got.id, 43);
+        assert_eq!(old_wakes.0.load(SeqCst), 0, "stale waker woken");
+        drop(got);
+        assert_eq!(probe.drops(), 1);
+    }
+}
