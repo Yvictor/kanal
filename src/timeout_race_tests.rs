@@ -1528,6 +1528,28 @@ mod async_waker {
         assert_eq!(probe.drops(), 1);
     }
 
+    #[test]
+    fn timeout_race_repolled_send_future_wakes_the_latest_waker() {
+        let probe = Big::probe();
+        let (tx, rx) = bounded_async::<Big>(0);
+        let mut fut = Box::pin(tx.send(Big::make(&probe, 42)));
+        let (old, old_wakes) = counting_waker();
+        let (new, new_wakes) = counting_waker();
+        assert!(poll_once(fut.as_mut(), &old).is_pending());
+        assert!(poll_once(fut.as_mut(), &new).is_pending());
+        let got = rx.try_recv().unwrap().expect("queued send not visible");
+        assert_eq!(got.id, 42);
+        assert_eq!(
+            new_wakes.0.load(SeqCst),
+            1,
+            "the waker of the latest poll was never woken (lost wakeup)"
+        );
+        assert_eq!(old_wakes.0.load(SeqCst), 0, "stale waker woken");
+        assert!(matches!(poll_once(fut.as_mut(), &new), Poll::Ready(Ok(()))));
+        drop(got);
+        assert_eq!(probe.drops(), 1);
+    }
+
     /// A peer that takes the signal while the future replaces its waker must
     /// not be able to see (and wake) the old waker after the future decided
     /// the signal was still queued. The peer runs inside the window through
@@ -1569,6 +1591,46 @@ mod async_waker {
             }
         };
         assert_eq!(got.id, 43);
+        assert_eq!(old_wakes.0.load(SeqCst), 0, "stale waker woken");
+        drop(got);
+        assert_eq!(probe.drops(), 1);
+    }
+
+    #[test]
+    fn timeout_race_send_future_waker_swap_is_atomic_with_queue_check() {
+        let probe = Big::probe();
+        let (tx, rx) = bounded_async::<Big>(0);
+        let mut fut = Box::pin(tx.send(Big::make(&probe, 44)));
+        let (old, old_wakes) = counting_waker();
+        let (new, new_wakes) = counting_waker();
+        assert!(poll_once(fut.as_mut(), &old).is_pending());
+        let taken = Rc::new(RefCell::new(None));
+        let (hook_rx, hook_taken) = (rx.clone_sync(), taken.clone());
+        let hook = test_hooks::set(move |point| {
+            if point == Hook::WakerSwap {
+                *hook_taken.borrow_mut() = hook_rx.try_recv_realtime().ok().flatten();
+            }
+            None
+        });
+        let polled = poll_once(fut.as_mut(), &new);
+        drop(hook);
+        if polled.is_pending() {
+            let mut taken = taken.borrow_mut();
+            if taken.is_none() {
+                *taken = rx.try_recv().unwrap();
+            }
+            assert!(taken.is_some(), "queued send not visible");
+            assert_eq!(
+                new_wakes.0.load(SeqCst),
+                1,
+                "value taken but only the replaced waker was woken"
+            );
+            assert!(matches!(poll_once(fut.as_mut(), &new), Poll::Ready(Ok(()))));
+        } else {
+            assert!(matches!(polled, Poll::Ready(Ok(()))));
+        }
+        let got = taken.borrow_mut().take().expect("value lost");
+        assert_eq!(got.id, 44);
         assert_eq!(old_wakes.0.load(SeqCst), 0, "stale waker woken");
         drop(got);
         assert_eq!(probe.drops(), 1);

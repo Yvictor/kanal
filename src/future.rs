@@ -195,13 +195,19 @@ impl<T> Future for SendFuture<'_, T> {
                 Poll::Pending => {
                     if !this.sig.will_wake(cx.waker()) {
                         // Waker is changed and we need to update waker in the waiting list
-                        if acquire_internal(this.internal).send_signal_exists(&this.sig) {
+                        let internal = acquire_internal(this.internal);
+                        if internal.send_signal_exists(&this.sig) {
                             test_hook!(WakerSwap);
-                            // signal is not shared with other thread yet so it's safe to
-                            // update waker locally
-                            // this.sig.register_waker(cx.waker());
+                            // The signal is still queued and we hold the lock, so no
+                            // receiver can take it (and read the waker) while it is
+                            // replaced. Without this the receiver would only wake the
+                            // stale waker and this future would never be woken.
+                            let old_waker = this.sig.replace_waker(cx.waker());
+                            drop(internal);
+                            drop(old_waker);
                             Poll::Pending
                         } else {
+                            drop(internal);
                             // signal is already shared, and data will be available shortly, so wait
                             // synchronously and return the result note:
                             // it's not possible safely to update waker after the signal is shared,
