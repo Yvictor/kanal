@@ -1,0 +1,19 @@
+[package]
+name = "channel-compare"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: not part of the kanal crate or its workspace.
+[workspace]
+
+[dependencies]
+kanal = { path = ".." }
+crossbeam-channel = "0.5"
+flume = "0.11"
+async-channel = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
