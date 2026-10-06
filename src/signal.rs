@@ -157,6 +157,30 @@ impl<T> Signal<T> {
         }
     }
 
+    /// Waits for the signal after a timed-out `wait_timeout` failed to cancel
+    /// it, i.e. the peer already took the signal and will finish it.
+    ///
+    /// `wait_timeout` may have left the state at `LOCKED_STARVATION` with this
+    /// thread registered as the waker. `wait()` cannot be reused here: its
+    /// `LOCKED -> LOCKED_STARVATION` CAS fails on that state and it would
+    /// report the signal as terminated although the peer is still completing
+    /// it, which surfaced as a spurious `Closed` on a live channel.
+    #[inline(always)]
+    pub(crate) fn wait_after_timeout(&self) -> bool {
+        loop {
+            let v = self.state.load(Ordering::Relaxed);
+            if v < LOCKED {
+                fence(Ordering::Acquire);
+                return v == UNLOCKED;
+            }
+            if v == LOCKED {
+                return self.wait();
+            }
+            // LOCKED_STARVATION: our thread is registered, wake() unparks it.
+            std::thread::park();
+        }
+    }
+
     /// Waits for the signal event in sync mode with a timeout
     pub(crate) fn wait_timeout(&self, until: Instant) -> bool {
         let v = self.state.load(Ordering::Relaxed);

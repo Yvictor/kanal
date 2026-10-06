@@ -731,6 +731,8 @@ impl<T> Sender<T> {
         }
         if let Some(first) = internal.next_recv() {
             drop(internal);
+            #[cfg(test)]
+            timeout_race_tests::handoff_delay();
             // Safety: it's safe to send to owned signal once
             unsafe { first.send(data) }
             Ok(())
@@ -818,8 +820,9 @@ impl<T> Sender<T> {
                         return Err(SendErrorTimeout::Timeout);
                     }
                 }
-                // removing receive failed to wait for the signal response
-                if !sig.wait() {
+                // removing send failed: the receiver owns the signal now and
+                // will complete it, so wait for that instead of timing out.
+                if !sig.wait_after_timeout() {
                     // Safety: data failed to move, sender should drop it if it
                     // needs to
                     if needs_drop::<T>() {
@@ -1127,6 +1130,8 @@ impl<T> Receiver<T> {
             Ok(v)
         } else if let Some(p) = internal.next_send() {
             drop(internal);
+            #[cfg(test)]
+            timeout_race_tests::handoff_delay();
             // Safety: it's safe to receive from owned signal once
             unsafe { Ok(p.recv()) }
         } else {
@@ -1194,8 +1199,9 @@ impl<T> Receiver<T> {
                         return Err(ReceiveErrorTimeout::Timeout);
                     }
                 }
-                // removing receive failed to wait for the signal response
-                if !sig.wait() {
+                // removing receive failed: the sender owns the signal now and
+                // will complete it, so wait for that instead of timing out.
+                if !sig.wait_after_timeout() {
                     return Err(ReceiveErrorTimeout::Closed);
                 }
             }
@@ -1641,4 +1647,58 @@ pub fn unbounded_async<T>() -> (AsyncSender<T>, AsyncReceiver<T>) {
         },
         AsyncReceiver { internal },
     )
+}
+
+#[cfg(test)]
+mod timeout_race_tests {
+    //! A timed-out wait whose signal was already taken by the peer must wait
+    //! for the peer instead of reporting `Closed`. The race needs the peer to
+    //! be preempted between taking the signal and completing it; the
+    //! per-thread delay below makes that window deterministic.
+    use super::*;
+    use std::cell::Cell;
+    use std::thread;
+    use std::time::Duration;
+
+    thread_local! {
+        static HANDOFF_DELAY: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    /// Called between a peer taking a waiter's signal and completing it.
+    pub(crate) fn handoff_delay() {
+        let delay = HANDOFF_DELAY.with(Cell::get);
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+    }
+
+    #[test]
+    fn recv_timeout_waits_for_sender_that_took_its_signal() {
+        let (tx, rx) = unbounded::<String>();
+        let sender = thread::spawn(move || {
+            HANDOFF_DELAY.with(|d| d.set(Duration::from_millis(200)));
+            // Let the receiver park first, then take its signal and stall.
+            thread::sleep(Duration::from_millis(20));
+            tx.send("tick".to_string()).unwrap();
+            tx
+        });
+        let got = rx.recv_timeout(Duration::from_millis(60));
+        let _tx = sender.join().unwrap();
+        assert_eq!(got.as_deref(), Ok("tick"));
+    }
+
+    #[test]
+    fn send_timeout_waits_for_receiver_that_took_its_signal() {
+        let (tx, rx) = bounded::<String>(0);
+        let receiver = thread::spawn(move || {
+            HANDOFF_DELAY.with(|d| d.set(Duration::from_millis(200)));
+            thread::sleep(Duration::from_millis(20));
+            let got = rx.recv();
+            (rx, got)
+        });
+        let sent = tx.send_timeout("order".to_string(), Duration::from_millis(60));
+        let (_rx, got) = receiver.join().unwrap();
+        assert_eq!(sent, Ok(()));
+        assert_eq!(got.as_deref(), Ok("order"));
+    }
 }
