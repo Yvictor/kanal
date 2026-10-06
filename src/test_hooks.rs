@@ -12,6 +12,7 @@ use std::time::Instant;
 
 /// Instrumented points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "async"), allow(dead_code))]
 pub(crate) enum Hook {
     /// A peer took a waiter's signal out of the wait list and released the
     /// channel lock, but has not completed the signal yet.
