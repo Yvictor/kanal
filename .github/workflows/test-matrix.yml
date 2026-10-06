@@ -1,0 +1,45 @@
+name: Tests (Linux, macOS, Windows)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.toolchain }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        toolchain: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: Test (debug, all features)
+        run: cargo test --all-features
+      - name: Test (release, all features)
+        run: cargo test --release --all-features
+      - name: Test (sync only, std-mutex)
+        run: cargo test --no-default-features --features std-mutex --lib --test sync_test --test timeout_stress
+
+  miri:
+    name: Miri (timeout race tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Miri
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo miri test --lib timeout_race

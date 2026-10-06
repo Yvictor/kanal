@@ -89,21 +89,19 @@ fn recv_timeout_clone_sync_should_not_return_closed() {
     let received_clone = received.clone();
     let spurious_clone = spurious_closed.clone();
 
-    let recv_handle = std::thread::spawn(move || {
-        loop {
-            match sync_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(msg) => {
-                    received_clone.fetch_add(1, Ordering::SeqCst);
-                    if msg == "done" {
-                        break;
-                    }
+    let recv_handle = std::thread::spawn(move || loop {
+        match sync_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(msg) => {
+                received_clone.fetch_add(1, Ordering::SeqCst);
+                if msg == "done" {
+                    break;
                 }
-                Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
-                Err(kanal::ReceiveErrorTimeout::SendClosed) => break,
-                Err(kanal::ReceiveErrorTimeout::Closed) => {
-                    spurious_clone.fetch_add(1, Ordering::SeqCst);
-                    continue;
-                }
+            }
+            Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
+            Err(kanal::ReceiveErrorTimeout::SendClosed) => break,
+            Err(kanal::ReceiveErrorTimeout::Closed) => {
+                spurious_clone.fetch_add(1, Ordering::SeqCst);
+                continue;
             }
         }
     });
@@ -136,17 +134,15 @@ fn recv_timeout_stress_no_spurious_closed() {
         let spurious = Arc::new(AtomicUsize::new(0));
         let spurious_clone = spurious.clone();
 
-        let recv_handle = std::thread::spawn(move || {
-            loop {
-                match receiver.recv_timeout(Duration::from_millis(10)) {
-                    Ok(v) if v == u32::MAX => break,
-                    Ok(_) => {}
-                    Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
-                    Err(kanal::ReceiveErrorTimeout::SendClosed) => break,
-                    Err(kanal::ReceiveErrorTimeout::Closed) => {
-                        spurious_clone.fetch_add(1, Ordering::SeqCst);
-                        continue;
-                    }
+        let recv_handle = std::thread::spawn(move || loop {
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(v) if v == u32::MAX => break,
+                Ok(_) => {}
+                Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
+                Err(kanal::ReceiveErrorTimeout::SendClosed) => break,
+                Err(kanal::ReceiveErrorTimeout::Closed) => {
+                    spurious_clone.fetch_add(1, Ordering::SeqCst);
+                    continue;
                 }
             }
         });
@@ -165,6 +161,10 @@ fn recv_timeout_stress_no_spurious_closed() {
         recv_handle.join().unwrap();
 
         let s = spurious.load(Ordering::SeqCst);
-        assert_eq!(s, 0, "Iteration {}: {} spurious Closed errors", iteration, s);
+        assert_eq!(
+            s, 0,
+            "Iteration {}: {} spurious Closed errors",
+            iteration, s
+        );
     }
 }

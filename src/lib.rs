@@ -314,6 +314,8 @@ macro_rules! shared_send_impl {
             }
             if let Some(first) = internal.next_recv() {
                 drop(internal);
+                #[cfg(test)]
+                timeout_race_tests::handoff_delay();
                 // Safety: it's safe to send to owned signal once
                 unsafe { first.send(data) }
                 return Ok(true);
@@ -365,6 +367,8 @@ macro_rules! shared_send_impl {
             }
             if let Some(first) = internal.next_recv() {
                 drop(internal);
+                #[cfg(test)]
+                timeout_race_tests::handoff_delay();
                 // Safety: it's safe to send to owned signal once
                 unsafe { first.send(data.take().unwrap()) }
                 return Ok(true);
@@ -412,6 +416,8 @@ macro_rules! shared_send_impl {
                 }
                 if let Some(first) = internal.next_recv() {
                     drop(internal);
+                    #[cfg(test)]
+                    timeout_race_tests::handoff_delay();
                     // Safety: it's safe to send to owned signal once
                     unsafe { first.send(data) }
                     return Ok(true);
@@ -464,6 +470,8 @@ macro_rules! shared_send_impl {
                 }
                 if let Some(first) = internal.next_recv() {
                     drop(internal);
+                    #[cfg(test)]
+                    timeout_race_tests::handoff_delay();
                     // Safety: it's safe to send to owned signal once
                     unsafe { first.send(data.take().unwrap()) }
                     return Ok(true);
@@ -791,6 +799,8 @@ impl<T> Sender<T> {
         }
         if let Some(first) = internal.next_recv() {
             drop(internal);
+            #[cfg(test)]
+            timeout_race_tests::handoff_delay();
             // Safety: it's safe to send to owned signal once
             unsafe { first.send(data) }
             Ok(())
@@ -817,6 +827,12 @@ impl<T> Sender<T> {
                 {
                     let mut internal = acquire_internal(&self.internal);
                     if internal.cancel_send_signal(&sig) {
+                        drop(internal);
+                        // Safety: the signal was cancelled, so the data never
+                        // moved; drop it as documented instead of leaking it.
+                        if needs_drop::<T>() {
+                            unsafe { data.assume_init_drop() }
+                        }
                         return Err(SendErrorTimeout::Timeout);
                     }
                 }
@@ -876,6 +892,8 @@ impl<T> Sender<T> {
         }
         if let Some(first) = internal.next_recv() {
             drop(internal);
+            #[cfg(test)]
+            timeout_race_tests::handoff_delay();
             // Safety: it's safe to send to owned signal once
             unsafe { first.send(data.take().unwrap()) }
             Ok(())
@@ -883,26 +901,32 @@ impl<T> Sender<T> {
             internal.queue.push_back(data.take().unwrap());
             Ok(())
         } else {
-            // send directly to the waitlist
-            let mut d = data.take().unwrap();
-            let sig = Signal::new_sync(KanalPtr::new_from(&mut d));
+            // send directly to the waitlist. The value lives in a
+            // MaybeUninit: once the receiver reads it through the signal it
+            // owns it, so the sender must not drop it again.
+            let mut d = MaybeUninit::new(data.take().unwrap());
+            let sig = Signal::new_sync(KanalPtr::new_from(d.as_mut_ptr()));
             internal.push_send(sig.get_terminator());
             drop(internal);
             if !sig.wait_timeout(deadline) {
                 if sig.is_terminated() {
-                    *data = Some(d);
+                    // Safety: the value was not moved out, hand it back.
+                    *data = Some(unsafe { d.assume_init_read() });
                     return Err(SendErrorTimeout::Closed);
                 }
                 {
                     let mut internal = acquire_internal(&self.internal);
                     if internal.cancel_send_signal(&sig) {
-                        *data = Some(d);
+                        // Safety: the value was not moved out, hand it back.
+                        *data = Some(unsafe { d.assume_init_read() });
                         return Err(SendErrorTimeout::Timeout);
                     }
                 }
-                // removing receive failed to wait for the signal response
-                if !sig.wait() {
-                    *data = Some(d);
+                // removing send failed: the receiver owns the signal now and
+                // will complete it, so wait for that instead of timing out.
+                if !sig.wait_after_timeout() {
+                    // Safety: the value was not moved out, hand it back.
+                    *data = Some(unsafe { d.assume_init_read() });
                     return Err(SendErrorTimeout::Closed);
                 }
             }
@@ -1175,6 +1199,8 @@ impl<T> Receiver<T> {
             Ok(v)
         } else if let Some(p) = internal.next_send() {
             drop(internal);
+            #[cfg(test)]
+            timeout_race_tests::handoff_delay();
             // Safety: it's safe to receive from owned signal once
             unsafe { Ok(p.recv()) }
         } else {
@@ -1654,9 +1680,12 @@ mod timeout_race_tests {
     //! A timed-out wait whose signal was already taken by the peer must wait
     //! for the peer instead of reporting `Closed`. The race needs the peer to
     //! be preempted between taking the signal and completing it; the
-    //! per-thread delay below makes that window deterministic.
+    //! per-thread delay below makes that window deterministic. Only test
+    //! builds call `handoff_delay`.
     use super::*;
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
@@ -1672,33 +1701,284 @@ mod timeout_race_tests {
         }
     }
 
-    #[test]
-    fn recv_timeout_waits_for_sender_that_took_its_signal() {
-        let (tx, rx) = unbounded::<String>();
+    fn set_delay(delay: Duration) {
+        HANDOFF_DELAY.with(|d| d.set(delay));
+    }
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    /// Payload that counts its drops, to catch double drops and leaks.
+    #[derive(Debug)]
+    struct Tracked {
+        id: u64,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    fn tracked(id: u64) -> (Tracked, Arc<AtomicUsize>) {
+        let drops = Arc::new(AtomicUsize::new(0));
+        (
+            Tracked {
+                id,
+                drops: drops.clone(),
+            },
+            drops,
+        )
+    }
+
+    /// Receiver parks in `recv_timeout`; the sender takes its signal after
+    /// `send_after`, then stalls `stall` before completing it.
+    fn recv_timeout_race(
+        cap: Option<usize>,
+        send_after: Duration,
+        stall: Duration,
+        timeout: Duration,
+    ) -> (Result<u64, ReceiveErrorTimeout>, Arc<AtomicUsize>) {
+        let (tx, rx) = match cap {
+            Some(cap) => bounded::<Tracked>(cap),
+            None => unbounded::<Tracked>(),
+        };
+        let (item, drops) = tracked(7);
         let sender = thread::spawn(move || {
-            HANDOFF_DELAY.with(|d| d.set(Duration::from_millis(200)));
-            // Let the receiver park first, then take its signal and stall.
-            thread::sleep(Duration::from_millis(20));
-            tx.send("tick".to_string()).unwrap();
+            set_delay(stall);
+            thread::sleep(send_after);
+            tx.send(item).unwrap();
             tx
         });
-        let got = rx.recv_timeout(Duration::from_millis(60));
+        let got = rx.recv_timeout(timeout).map(|t| t.id);
         let _tx = sender.join().unwrap();
-        assert_eq!(got.as_deref(), Ok("tick"));
+        (got, drops)
+    }
+
+    #[test]
+    fn recv_timeout_waits_for_sender_that_took_its_signal() {
+        for cap in [None, Some(0), Some(1), Some(16)] {
+            let (got, drops) = recv_timeout_race(cap, MS(20), MS(200), MS(60));
+            assert_eq!(got, Ok(7), "capacity {cap:?}");
+            assert_eq!(drops.load(AtomicOrdering::SeqCst), 1, "capacity {cap:?}");
+        }
+    }
+
+    #[test]
+    fn recv_timeout_race_is_correct_across_deadline_offsets() {
+        // Stalls that end before, at and after the deadline.
+        for stall_ms in [0, 1, 5, 30, 39, 40, 41, 60, 120] {
+            let (got, drops) = recv_timeout_race(None, MS(10), MS(stall_ms), MS(40));
+            assert_eq!(got, Ok(7), "stall {stall_ms}ms");
+            assert_eq!(drops.load(AtomicOrdering::SeqCst), 1, "stall {stall_ms}ms");
+        }
+    }
+
+    #[test]
+    fn recv_timeout_still_times_out_without_a_sender() {
+        let (_tx, rx) = unbounded::<u64>();
+        assert_eq!(rx.recv_timeout(MS(20)), Err(ReceiveErrorTimeout::Timeout));
+    }
+
+    #[test]
+    fn recv_timeout_still_reports_real_disconnect() {
+        let (tx, rx) = unbounded::<u64>();
+        let dropper = thread::spawn(move || {
+            thread::sleep(MS(20));
+            drop(tx);
+        });
+        let got = rx.recv_timeout(MS(500));
+        dropper.join().unwrap();
+        assert!(
+            matches!(
+                got,
+                Err(ReceiveErrorTimeout::Closed | ReceiveErrorTimeout::SendClosed)
+            ),
+            "{got:?}"
+        );
+    }
+
+    /// Sender parks in `send_timeout`; the receiver takes its signal after
+    /// `recv_after`, then stalls `stall` before completing it.
+    fn send_timeout_race(
+        cap: usize,
+        recv_after: Duration,
+        stall: Duration,
+        timeout: Duration,
+    ) -> (Result<(), SendErrorTimeout>, Option<u64>, Arc<AtomicUsize>) {
+        let (tx, rx) = bounded::<Tracked>(cap);
+        for _ in 0..cap {
+            // Fill the buffer so the next send has to wait.
+            let (filler, _) = tracked(0);
+            tx.send(filler).unwrap();
+        }
+        let (item, drops) = tracked(9);
+        let receiver = thread::spawn(move || {
+            set_delay(stall);
+            thread::sleep(recv_after);
+            let mut last = None;
+            for _ in 0..=cap {
+                last = rx.recv().ok().map(|t| t.id);
+            }
+            (rx, last)
+        });
+        let sent = tx.send_timeout(item, timeout);
+        let (_rx, last) = receiver.join().unwrap();
+        (sent, last, drops)
     }
 
     #[test]
     fn send_timeout_waits_for_receiver_that_took_its_signal() {
-        let (tx, rx) = bounded::<String>(0);
+        let (sent, got, drops) = send_timeout_race(0, MS(20), MS(200), MS(60));
+        assert_eq!(sent, Ok(()));
+        assert_eq!(got, Some(9));
+        assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn send_timeout_race_is_correct_across_deadline_offsets() {
+        for stall_ms in [0, 1, 5, 30, 39, 40, 41, 60, 120] {
+            let (sent, got, drops) = send_timeout_race(0, MS(10), MS(stall_ms), MS(40));
+            assert_eq!(sent, Ok(()), "stall {stall_ms}ms");
+            assert_eq!(got, Some(9), "stall {stall_ms}ms");
+            assert_eq!(drops.load(AtomicOrdering::SeqCst), 1, "stall {stall_ms}ms");
+        }
+    }
+
+    #[test]
+    fn send_option_timeout_waits_for_receiver_that_took_its_signal() {
+        let (tx, rx) = bounded::<Tracked>(0);
+        let (item, drops) = tracked(5);
         let receiver = thread::spawn(move || {
-            HANDOFF_DELAY.with(|d| d.set(Duration::from_millis(200)));
-            thread::sleep(Duration::from_millis(20));
-            let got = rx.recv();
+            set_delay(MS(200));
+            thread::sleep(MS(20));
+            let got = rx.recv().map(|t| t.id);
             (rx, got)
         });
-        let sent = tx.send_timeout("order".to_string(), Duration::from_millis(60));
+        let mut data = Some(item);
+        let sent = tx.send_option_timeout(&mut data, MS(60));
         let (_rx, got) = receiver.join().unwrap();
         assert_eq!(sent, Ok(()));
-        assert_eq!(got.as_deref(), Ok("order"));
+        assert!(data.is_none(), "data must have moved to the receiver");
+        assert_eq!(got, Ok(5));
+        assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn send_option_timeout_hands_off_without_double_drop() {
+        // No stall: the receiver completes the parked sender normally.
+        let (tx, rx) = bounded::<Tracked>(0);
+        let (item, drops) = tracked(6);
+        let receiver = thread::spawn(move || {
+            thread::sleep(MS(20));
+            let got = rx.recv().map(|t| t.id);
+            (rx, got)
+        });
+        let mut data = Some(item);
+        let sent = tx.send_option_timeout(&mut data, MS(500));
+        let (_rx, got) = receiver.join().unwrap();
+        assert_eq!(sent, Ok(()));
+        assert!(data.is_none());
+        assert_eq!(got, Ok(6));
+        assert_eq!(
+            Arc::strong_count(&drops),
+            1,
+            "payload dropped more than once"
+        );
+        assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn send_timeout_still_times_out_and_drops_data_once() {
+        let (tx, _rx) = bounded::<Tracked>(0);
+        let (item, drops) = tracked(1);
+        assert_eq!(
+            tx.send_timeout(item, MS(20)),
+            Err(SendErrorTimeout::Timeout)
+        );
+        assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn send_option_timeout_returns_data_on_timeout() {
+        let (tx, _rx) = bounded::<Tracked>(0);
+        let (item, drops) = tracked(2);
+        let mut data = Some(item);
+        assert_eq!(
+            tx.send_option_timeout(&mut data, MS(20)),
+            Err(SendErrorTimeout::Timeout)
+        );
+        assert_eq!(data.as_ref().map(|t| t.id), Some(2));
+        drop(data);
+        assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn send_timeout_still_reports_real_disconnect() {
+        let (tx, rx) = bounded::<Tracked>(0);
+        let (item, drops) = tracked(3);
+        let dropper = thread::spawn(move || {
+            thread::sleep(MS(20));
+            drop(rx);
+        });
+        let sent = tx.send_timeout(item, MS(500));
+        dropper.join().unwrap();
+        assert!(
+            matches!(
+                sent,
+                Err(SendErrorTimeout::Closed | SendErrorTimeout::ReceiveClosed)
+            ),
+            "{sent:?}"
+        );
+        assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn many_stalled_handoffs_lose_and_duplicate_nothing() {
+        // Several receivers with short timeouts against senders that stall
+        // after taking a signal; every message must arrive exactly once.
+        const PRODUCERS: u64 = 4;
+        const PER_PRODUCER: u64 = 200;
+        let (tx, rx) = unbounded::<u64>();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let consumers: Vec<_> = (0..4)
+            .map(|_| {
+                let rx = rx.clone();
+                let seen = seen.clone();
+                thread::spawn(move || loop {
+                    match rx.recv_timeout(Duration::from_micros(300)) {
+                        Ok(v) => seen.lock().unwrap().push(v),
+                        Err(ReceiveErrorTimeout::Timeout) => {}
+                        Err(e) => {
+                            assert!(rx.is_disconnected(), "spurious {e:?} on a live channel");
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(rx);
+        let producers: Vec<_> = (0..PRODUCERS)
+            .map(|p| {
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    for i in 0..PER_PRODUCER {
+                        set_delay(Duration::from_micros(if i % 3 == 0 { 400 } else { 0 }));
+                        thread::sleep(Duration::from_micros(150));
+                        tx.send(p * PER_PRODUCER + i).unwrap();
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        for p in producers {
+            p.join().unwrap();
+        }
+        for c in consumers {
+            c.join().unwrap();
+        }
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..PRODUCERS * PER_PRODUCER).collect::<Vec<_>>());
     }
 }
