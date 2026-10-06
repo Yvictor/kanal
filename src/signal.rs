@@ -87,6 +87,7 @@ impl<T> Signal<T> {
             fence(Ordering::Acquire);
             return v == UNLOCKED;
         }
+        test_hook!(AwaitPeerAsync);
 
         for _ in 0..32 {
             backoff::yield_os();
@@ -177,6 +178,9 @@ impl<T> Signal<T> {
                 return self.wait();
             }
             // LOCKED_STARVATION: our thread is registered, wake() unparks it.
+            // A spurious wakeup or a completion right after the load above
+            // just loops back to the state check.
+            test_hook!(AwaitPeerPark);
             std::thread::park();
         }
     }

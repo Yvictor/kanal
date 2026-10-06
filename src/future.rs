@@ -150,6 +150,7 @@ impl<T> Future for SendFuture<'_, T> {
                 if let Some(first) = internal.next_recv() {
                     drop(internal);
                     this.state = FutureState::Done;
+                    test_hook!(Handoff);
                     // Safety: data is inited and available from constructor
                     unsafe { first.send(this.read_local_data()) }
                     Poll::Ready(Ok(()))
@@ -195,6 +196,7 @@ impl<T> Future for SendFuture<'_, T> {
                     if !this.sig.will_wake(cx.waker()) {
                         // Waker is changed and we need to update waker in the waiting list
                         if acquire_internal(this.internal).send_signal_exists(&this.sig) {
+                            test_hook!(WakerSwap);
                             // signal is not shared with other thread yet so it's safe to
                             // update waker locally
                             // this.sig.register_waker(cx.waker());
@@ -329,6 +331,7 @@ impl<T> Future for ReceiveFuture<'_, T> {
                     } else if let Some(t) = internal.next_send() {
                         drop(internal);
                         this.state = FutureState::Done;
+                        test_hook!(Handoff);
                         Poll::Ready(Ok(unsafe { t.recv() }))
                     } else {
                         if internal.send_count == 0 {
@@ -363,6 +366,7 @@ impl<T> Future for ReceiveFuture<'_, T> {
                             // the Waker is changed and we need to update waker in the waiting
                             // list
                             if acquire_internal(this.internal).recv_signal_exists(&this.sig) {
+                                test_hook!(WakerSwap);
                                 // signal is not shared with other thread yet so it's safe
                                 // to update waker locally
                                 this.sig.register_waker(cx.waker());
