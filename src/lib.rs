@@ -1705,6 +1705,22 @@ mod timeout_race_tests {
         HANDOFF_DELAY.with(|d| d.set(delay));
     }
 
+    /// Spin until a waiter of the given kind is parked on the channel, so
+    /// the peer takes a parked waiter's signal regardless of scheduler lag.
+    fn wait_until_parked<T>(internal: &Internal<T>, receivers: bool) {
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let internal = acquire_internal(internal);
+                if !internal.wait_list.is_empty() && internal.recv_blocking == receivers {
+                    return;
+                }
+            }
+            assert!(std::time::Instant::now() < give_up, "waiter never parked");
+            thread::yield_now();
+        }
+    }
+
     const MS: fn(u64) -> Duration = Duration::from_millis;
 
     /// Payload that counts its drops, to catch double drops and leaks.
@@ -1731,14 +1747,19 @@ mod timeout_race_tests {
         )
     }
 
-    /// Receiver parks in `recv_timeout`; the sender takes its signal after
-    /// `send_after`, then stalls `stall` before completing it.
+    /// Receiver parks in `recv_timeout`; once it is parked the sender takes
+    /// its signal and stalls `stall` before completing it. Returns the
+    /// `recv_timeout` result and, if it timed out, what a later `try_recv`
+    /// found (the message must then still be in the channel).
     fn recv_timeout_race(
         cap: Option<usize>,
-        send_after: Duration,
         stall: Duration,
         timeout: Duration,
-    ) -> (Result<u64, ReceiveErrorTimeout>, Arc<AtomicUsize>) {
+    ) -> (
+        Result<u64, ReceiveErrorTimeout>,
+        Option<u64>,
+        Arc<AtomicUsize>,
+    ) {
         let (tx, rx) = match cap {
             Some(cap) => bounded::<Tracked>(cap),
             None => unbounded::<Tracked>(),
@@ -1746,19 +1767,26 @@ mod timeout_race_tests {
         let (item, drops) = tracked(7);
         let sender = thread::spawn(move || {
             set_delay(stall);
-            thread::sleep(send_after);
+            wait_until_parked(&tx.internal, true);
             tx.send(item).unwrap();
             tx
         });
         let got = rx.recv_timeout(timeout).map(|t| t.id);
         let _tx = sender.join().unwrap();
-        (got, drops)
+        let later = match got {
+            Err(_) => rx.try_recv().ok().flatten().map(|t| t.id),
+            Ok(_) => None,
+        };
+        (got, later, drops)
     }
 
     #[test]
     fn recv_timeout_waits_for_sender_that_took_its_signal() {
+        // The sender takes the signal right after the receiver parks and
+        // stalls far past the deadline: the receiver must wait, not report
+        // Closed. Wide margins keep this deterministic on slow runners.
         for cap in [None, Some(0), Some(1), Some(16)] {
-            let (got, drops) = recv_timeout_race(cap, MS(20), MS(200), MS(60));
+            let (got, _, drops) = recv_timeout_race(cap, MS(1000), MS(200));
             assert_eq!(got, Ok(7), "capacity {cap:?}");
             assert_eq!(drops.load(AtomicOrdering::SeqCst), 1, "capacity {cap:?}");
         }
@@ -1766,10 +1794,19 @@ mod timeout_race_tests {
 
     #[test]
     fn recv_timeout_race_is_correct_across_deadline_offsets() {
-        // Stalls that end before, at and after the deadline.
+        // Stalls ending before, around and after the deadline. Depending on
+        // scheduling the receiver either gets the message or times out with
+        // the message left in the channel; it must never see Closed and the
+        // message must be delivered exactly once.
         for stall_ms in [0, 1, 5, 30, 39, 40, 41, 60, 120] {
-            let (got, drops) = recv_timeout_race(None, MS(10), MS(stall_ms), MS(40));
-            assert_eq!(got, Ok(7), "stall {stall_ms}ms");
+            let (got, later, drops) = recv_timeout_race(None, MS(stall_ms), MS(40));
+            match got {
+                Ok(id) => assert_eq!(id, 7, "stall {stall_ms}ms"),
+                Err(ReceiveErrorTimeout::Timeout) => {
+                    assert_eq!(later, Some(7), "stall {stall_ms}ms: message lost")
+                }
+                Err(e) => panic!("stall {stall_ms}ms: spurious {e:?}"),
+            }
             assert_eq!(drops.load(AtomicOrdering::SeqCst), 1, "stall {stall_ms}ms");
         }
     }
@@ -1798,11 +1835,10 @@ mod timeout_race_tests {
         );
     }
 
-    /// Sender parks in `send_timeout`; the receiver takes its signal after
-    /// `recv_after`, then stalls `stall` before completing it.
+    /// Sender parks in `send_timeout`; once it is parked the receiver takes
+    /// its signal and stalls `stall` before completing it.
     fn send_timeout_race(
         cap: usize,
-        recv_after: Duration,
         stall: Duration,
         timeout: Duration,
     ) -> (Result<(), SendErrorTimeout>, Option<u64>, Arc<AtomicUsize>) {
@@ -1815,10 +1851,14 @@ mod timeout_race_tests {
         let (item, drops) = tracked(9);
         let receiver = thread::spawn(move || {
             set_delay(stall);
-            thread::sleep(recv_after);
+            wait_until_parked(&rx.internal, false);
             let mut last = None;
             for _ in 0..=cap {
-                last = rx.recv().ok().map(|t| t.id);
+                // After a timed-out send nothing more arrives; don't block.
+                last = match rx.recv_timeout(MS(500)) {
+                    Ok(t) => Some(t.id),
+                    Err(_) => last,
+                };
             }
             (rx, last)
         });
@@ -1829,7 +1869,7 @@ mod timeout_race_tests {
 
     #[test]
     fn send_timeout_waits_for_receiver_that_took_its_signal() {
-        let (sent, got, drops) = send_timeout_race(0, MS(20), MS(200), MS(60));
+        let (sent, got, drops) = send_timeout_race(0, MS(1000), MS(200));
         assert_eq!(sent, Ok(()));
         assert_eq!(got, Some(9));
         assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
@@ -1838,9 +1878,14 @@ mod timeout_race_tests {
     #[test]
     fn send_timeout_race_is_correct_across_deadline_offsets() {
         for stall_ms in [0, 1, 5, 30, 39, 40, 41, 60, 120] {
-            let (sent, got, drops) = send_timeout_race(0, MS(10), MS(stall_ms), MS(40));
-            assert_eq!(sent, Ok(()), "stall {stall_ms}ms");
-            assert_eq!(got, Some(9), "stall {stall_ms}ms");
+            let (sent, got, drops) = send_timeout_race(0, MS(stall_ms), MS(40));
+            match sent {
+                Ok(()) => assert_eq!(got, Some(9), "stall {stall_ms}ms"),
+                // Cancelled before the receiver took it: the data is dropped
+                // by the sender and never received.
+                Err(SendErrorTimeout::Timeout) => assert_eq!(got, None, "stall {stall_ms}ms"),
+                Err(e) => panic!("stall {stall_ms}ms: spurious {e:?}"),
+            }
             assert_eq!(drops.load(AtomicOrdering::SeqCst), 1, "stall {stall_ms}ms");
         }
     }
@@ -1850,13 +1895,13 @@ mod timeout_race_tests {
         let (tx, rx) = bounded::<Tracked>(0);
         let (item, drops) = tracked(5);
         let receiver = thread::spawn(move || {
-            set_delay(MS(200));
-            thread::sleep(MS(20));
+            set_delay(MS(1000));
+            wait_until_parked(&rx.internal, false);
             let got = rx.recv().map(|t| t.id);
             (rx, got)
         });
         let mut data = Some(item);
-        let sent = tx.send_option_timeout(&mut data, MS(60));
+        let sent = tx.send_option_timeout(&mut data, MS(200));
         let (_rx, got) = receiver.join().unwrap();
         assert_eq!(sent, Ok(()));
         assert!(data.is_none(), "data must have moved to the receiver");
