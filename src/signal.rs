@@ -87,6 +87,7 @@ impl<T> Signal<T> {
             fence(Ordering::Acquire);
             return v == UNLOCKED;
         }
+        test_hook!(AwaitPeerAsync);
 
         for _ in 0..32 {
             backoff::yield_os();
@@ -177,6 +178,9 @@ impl<T> Signal<T> {
                 return self.wait();
             }
             // LOCKED_STARVATION: our thread is registered, wake() unparks it.
+            // A spurious wakeup or a completion right after the load above
+            // just loops back to the state check.
+            test_hook!(AwaitPeerPark);
             std::thread::park();
         }
     }
@@ -233,6 +237,18 @@ impl<T> Signal<T> {
     #[cfg(feature = "async")]
     pub(crate) fn register_waker(&mut self, waker: &Waker) {
         self.waker = KanalWaker::Async(waker.clone())
+    }
+
+    /// Replaces the registered async waker and returns the previous one.
+    /// Only call this while the signal is still in the wait list and the
+    /// channel lock is held: a peer reads the waker as soon as it took the
+    /// signal. Drop the returned waker after releasing the lock, as dropping
+    /// a waker may run arbitrary code.
+    #[inline(always)]
+    #[cfg(feature = "async")]
+    #[must_use]
+    pub(crate) fn replace_waker(&mut self, waker: &Waker) -> KanalWaker {
+        core::mem::replace(&mut self.waker, KanalWaker::Async(waker.clone()))
     }
 
     /// Set pointer to data for receiving or sending

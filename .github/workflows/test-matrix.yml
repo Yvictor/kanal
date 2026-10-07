@@ -29,17 +29,32 @@ jobs:
         run: cargo test --release --all-features
       - name: Test (sync only, std-mutex)
         run: cargo test --no-default-features --features std-mutex --lib --test sync_test --test timeout_stress
+      # Default features use kanal's own spin mutex instead of std's; the
+      # all-features runs above enable std-mutex, so cover the default too.
+      - name: Test (debug, default features)
+        run: cargo test
+      - name: Test (release, default features)
+        run: cargo test --release
+      - name: Test (sync only, default mutex)
+        run: cargo test --no-default-features --lib --test sync_test --test timeout_stress
 
   miri:
     name: Miri (timeout race tests)
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    env:
+      # Isolation off: the tests use real deadlines (Instant::now).
+      MIRIFLAGS: -Zmiri-disable-isolation
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - name: Miri
-        env:
-          MIRIFLAGS: -Zmiri-disable-isolation
+      # Every test in timeout_race_tests (deterministic race, signal-level,
+      # async and waker tests); the stress test is ignored under Miri.
+      - name: Miri (default features, own mutex, async)
         run: cargo miri test --lib timeout_race
+      - name: Miri (all features, std-mutex)
+        run: cargo miri test --all-features --lib timeout_race
+      - name: Miri (sync only, own mutex)
+        run: cargo miri test --no-default-features --lib timeout_race
