@@ -1,0 +1,17 @@
+[package]
+name = "flume-scenarios"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Adversarial scenario tests for flume 0.12.0 as used by shioaji (mixed sync/async MPMC)"
+
+# Standalone: not part of the kanal crate or its workspace.
+[workspace]
+
+[dependencies]
+# Default features (async, select, eventual-fairness), no "spin": what shioaji would get.
+flume = "=0.12.0"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[profile.release]
+debug = 1

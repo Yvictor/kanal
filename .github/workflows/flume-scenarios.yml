@@ -1,0 +1,70 @@
+name: flume 0.12.0 adversarial scenarios (shioaji usage)
+
+on:
+  push:
+    branches: [bench/channel-compare]
+    paths:
+      - "flume-scenarios/**"
+      - ".github/workflows/flume-scenarios.yml"
+  workflow_dispatch:
+    inputs:
+      soak_secs:
+        description: "seconds of the shortened S6 soak (500 B; 24 B and 1.1 KB run a third of it)"
+        default: "60"
+
+jobs:
+  scenarios:
+    name: ${{ matrix.os }} ${{ matrix.load }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        load: [normal, contended]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        working-directory: flume-scenarios
+        run: cargo build --release
+      - name: Scenarios 1-5, known-bug repros, shortened 6
+        working-directory: flume-scenarios
+        shell: bash
+        run: |
+          FLAGS="short --soak-secs ${{ inputs.soak_secs || '60' }}"
+          if [ "${{ matrix.load }}" = "contended" ]; then FLAGS="$FLAGS --contend"; fi
+          mkdir -p results
+          set +e
+          cargo run --release -q -- $FLAGS > results/summary.md 2> results/log.txt
+          code=$?
+          set -e
+          cat results/summary.md
+          cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flume-scenarios-${{ matrix.os }}-${{ matrix.load }}
+          path: flume-scenarios/results/
+
+  miri:
+    name: miri (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Miri
+        working-directory: flume-scenarios
+        shell: bash
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-ignore-leaks
+        run: cargo miri test -- --test-threads=1 --nocapture 2>&1 | tee miri.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flume-scenarios-miri
+          path: flume-scenarios/miri.log
