@@ -1,0 +1,47 @@
+name: Channel comparison, shioaji paths (kanal vs crossbeam/tokio/flume/async-channel)
+
+on:
+  push:
+    branches: [bench/channel-compare]
+    paths:
+      - "channel-compare-shioaji/**"
+      - ".github/workflows/channel-compare-shioaji.yml"
+      - "src/**"
+  workflow_dispatch:
+    inputs:
+      long_secs:
+        description: "seconds of the long paced 10k msg/s run per variant (bursty runs half of it)"
+        default: "60"
+
+jobs:
+  bench:
+    name: ${{ matrix.os }} ${{ matrix.group }} ${{ matrix.load }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # A1: P1+P4, A2: P7 (MPMC), B: P2+P3, C: P6 (multi-route)
+        group: [A1, A2, B, C]
+        load: [normal, contended]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        working-directory: channel-compare-shioaji
+        run: cargo build --release
+      - name: Run
+        working-directory: channel-compare-shioaji
+        shell: bash
+        run: |
+          FLAGS="--group ${{ matrix.group }} --long-secs ${{ inputs.long_secs || '60' }} --out results"
+          if [ "${{ matrix.load }}" = "contended" ]; then FLAGS="$FLAGS --contend"; fi
+          cargo run --release -q -- $FLAGS > summary.md 2> log.txt || { cat log.txt; exit 1; }
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          cp log.txt results/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.os }}-${{ matrix.group }}-${{ matrix.load }}
+          path: channel-compare-shioaji/results/
