@@ -210,6 +210,43 @@ pub fn spin_cond<F: Fn() -> bool>(cond: F) {
     }
 }
 
+/// Like [`spin_cond`] but never sleeps: a short spin with `spin_hint`, then
+/// rounds of at most `MAX_SPINS` checks separated by `yield_os()`. Used for
+/// the channel mutex with feature `nosleep-spin`: the 1 ms sleep in
+/// `spin_cond` delays a waiter by up to a scheduler tick (1-16 ms) after the
+/// holder has already released the lock.
+#[allow(dead_code)]
+#[inline(always)]
+pub fn spin_cond_no_sleep<F: Fn() -> bool>(cond: F) {
+    if get_parallelism() == 1 {
+        while !cond() {
+            yield_os();
+        }
+        return;
+    }
+    const SPINS: u32 = 8;
+    const MAX_SPINS: u32 = 128;
+    for _ in 0..SPINS / 2 {
+        if cond() {
+            return;
+        }
+        spin_hint();
+    }
+    let mut spins: u32 = SPINS;
+    loop {
+        for _ in 0..spins {
+            if cond() {
+                return;
+            }
+            spin_hint();
+        }
+        yield_os();
+        if spins < MAX_SPINS {
+            spins <<= 1;
+        }
+    }
+}
+
 macro_rules! return_if_some {
     ($result:expr) => {{
         let result = $result;

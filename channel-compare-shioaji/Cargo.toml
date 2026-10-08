@@ -11,6 +11,9 @@ publish = false
 kanal = { path = ".." }
 # same kanal sources with std::sync::Mutex (feature std-mutex), see kanal-std-mutex/
 kanal_std = { package = "kanal-std-mutex", path = "kanal-std-mutex" }
+# kanal spin mutex without the ~1 ms backoff sleep, and parking_lot mutex
+kanal_ns = { package = "kanal-nosleep", path = "kanal-nosleep" }
+kanal_pl = { package = "kanal-parking-lot", path = "kanal-parking-lot" }
 crossbeam-channel = "0.5"
 flume = "0.11"
 async-channel = "2"

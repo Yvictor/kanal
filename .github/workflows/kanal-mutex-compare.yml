@@ -1,9 +1,10 @@
-name: kanal spin mutex vs std-mutex (shioaji paths)
+name: kanal lock variants, spin vs std-mutex / nosleep spin / parking_lot (shioaji paths)
 
-# Same kanal sources twice in one binary: `kanal` (own spin mutex, default)
-# and `kanal_std` (feature std-mutex), interleaved per scenario. Every group in
-# normal and contended mode, 2 repetitions (the 2nd runs the variants in
-# reverse order).
+# Same kanal sources four times in one binary, interleaved per scenario:
+# `kanal` (own spin mutex, default), `kanal_std` (feature std-mutex),
+# `kanal_ns` (feature nosleep-spin) and `kanal_pl` (feature parking-lot).
+# Every group in normal and contended mode, 4 repetitions; rep N rotates the
+# variant order by N-1 so each variant runs in each position once.
 
 on:
   push:
@@ -22,7 +23,7 @@ jobs:
   bench:
     name: ${{ matrix.os }} ${{ matrix.group }} ${{ matrix.load }} rep${{ matrix.rep }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -30,7 +31,7 @@ jobs:
         # A1: P1+P4, A2: P7 (MPMC), B: P2+P3, C: P6 (multi-route)
         group: [A1, A2, B, C]
         load: [normal, contended]
-        rep: [1, 2]
+        rep: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,7 +44,7 @@ jobs:
         run: |
           FLAGS="--kanal-only --group ${{ matrix.group }} --long-secs ${{ inputs.long_secs || '60' }} --out results --tag rep${{ matrix.rep }}"
           if [ "${{ matrix.load }}" = "contended" ]; then FLAGS="$FLAGS --contend"; fi
-          if [ "${{ matrix.rep }}" = "2" ]; then FLAGS="$FLAGS --reverse"; fi
+          FLAGS="$FLAGS --rotate $(( ${{ matrix.rep }} - 1 ))"
           cargo run --release -q -- $FLAGS > summary.md 2> log.txt || { cat log.txt; exit 1; }
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
           cp log.txt results/log-${{ matrix.group }}-${{ matrix.load }}-rep${{ matrix.rep }}.txt

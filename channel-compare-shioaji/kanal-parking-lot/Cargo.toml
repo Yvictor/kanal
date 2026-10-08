@@ -1,14 +1,13 @@
-# Second copy of the *same* kanal sources (../../src) built with the
-# `std-mutex` feature, under another crate name, so one benchmark binary can
-# interleave kanal's own spin mutex and std::sync::Mutex in the same process.
+# Same kanal sources (../../src) built with feature `parking-lot` under another
+# crate name, interleaved with the other lock variants in one binary.
 [package]
-name = "kanal-std-mutex"
+name = "kanal-parking-lot"
 version = "0.1.3"
 edition = "2021"
 publish = false
 
 [lib]
-name = "kanal_std"
+name = "kanal_pl"
 path = "../../src/lib.rs"
 
 [dependencies]
@@ -22,4 +21,4 @@ async = ["futures-core"]
 std-mutex = []
 nosleep-spin = []
 parking-lot = ["dep:parking_lot"]
-default = ["async", "std-mutex"]
+default = ["async", "parking-lot"]

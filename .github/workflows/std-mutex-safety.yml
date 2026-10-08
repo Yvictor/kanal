@@ -1,7 +1,7 @@
-name: std-mutex safety (tests + Miri, Linux/macOS/Windows)
+name: kanal lock variants safety (tests + Miri, Linux/macOS/Windows)
 
-# kanal's whole test suite and the Miri race tests for both mutexes on all
-# three OSes (test-matrix.yml runs Miri on Linux only).
+# kanal's whole test suite and the Miri race tests for every lock variant
+# (spin, std-mutex, nosleep-spin, parking-lot) on all three OSes (test-matrix.yml runs Miri on Linux only).
 
 on:
   push:
@@ -25,24 +25,24 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        mutex: [spin, std-mutex]
+        mutex: [spin, std-mutex, nosleep-spin, parking-lot]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Test (debug)
         shell: bash
-        run: cargo test ${{ matrix.mutex == 'std-mutex' && '--features std-mutex' || '' }}
+        run: cargo test ${{ matrix.mutex != 'spin' && format('--features {0}', matrix.mutex) || '' }}
       - name: Test (release, 3 rounds incl. stress)
         shell: bash
         run: |
           for i in 1 2 3; do
             echo "::group::round $i"
-            cargo test --release ${{ matrix.mutex == 'std-mutex' && '--features std-mutex' || '' }} || exit 1
+            cargo test --release ${{ matrix.mutex != 'spin' && format('--features {0}', matrix.mutex) || '' }} || exit 1
             echo "::endgroup::"
           done
       - name: Test (sync only)
         shell: bash
-        run: cargo test --no-default-features ${{ matrix.mutex == 'std-mutex' && '--features std-mutex' || '' }} --lib --test sync_test --test timeout_stress --test poison_behavior
+        run: cargo test --no-default-features ${{ matrix.mutex != 'spin' && format('--features {0}', matrix.mutex) || '' }} --lib --test sync_test --test timeout_stress --test poison_behavior
 
   miri:
     name: miri ${{ matrix.os }} ${{ matrix.mutex }}
@@ -52,7 +52,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        mutex: [spin, std-mutex]
+        mutex: [spin, std-mutex, nosleep-spin, parking-lot]
     env:
       MIRIFLAGS: -Zmiri-disable-isolation
     steps:
@@ -62,7 +62,7 @@ jobs:
           components: miri
       - name: Miri (timeout race tests, async)
         shell: bash
-        run: cargo miri test ${{ matrix.mutex == 'std-mutex' && '--features std-mutex' || '' }} --lib timeout_race
+        run: cargo miri test ${{ matrix.mutex != 'spin' && format('--features {0}', matrix.mutex) || '' }} --lib timeout_race
       - name: Miri (timeout race tests, sync only)
         shell: bash
-        run: cargo miri test --no-default-features ${{ matrix.mutex == 'std-mutex' && '--features std-mutex' || '' }} --lib timeout_race
+        run: cargo miri test --no-default-features ${{ matrix.mutex != 'spin' && format('--features {0}', matrix.mutex) || '' }} --lib timeout_race

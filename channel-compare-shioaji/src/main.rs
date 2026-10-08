@@ -18,7 +18,7 @@
 //! max series, threshold counts and the top spikes.
 //!
 //! Usage: channel-compare-shioaji [--group A1|A2|B|C|all] [--contend]
-//!        [--long-secs N] [--out DIR] [--quick] [--kanal-only] [--reverse]
+//!        [--long-secs N] [--out DIR] [--quick] [--kanal-only] [--reverse] [--rotate N]
 //!        [--tag SUFFIX]
 
 use std::hint::black_box;
@@ -228,6 +228,10 @@ enum Lib {
     Kanal,
     /// the same kanal sources built with feature `std-mutex` (crate kanal_std)
     KanalStd,
+    /// kanal spin mutex without the ~1 ms backoff sleep (crate kanal_ns)
+    KanalNs,
+    /// parking_lot::RawMutex as the channel mutex (crate kanal_pl)
+    KanalPl,
     Crossbeam,
     Tokio,
     Flume,
@@ -247,7 +251,11 @@ enum Tx<T> {
     KA(kanal::AsyncSender<T>),
     KS(kanal::Sender<T>),
     KA2(kanal_std::AsyncSender<T>),
+    KANS(kanal_ns::AsyncSender<T>),
+    KAPL(kanal_pl::AsyncSender<T>),
     KS2(kanal_std::Sender<T>),
+    KSNS(kanal_ns::Sender<T>),
+    KSPL(kanal_pl::Sender<T>),
     Cb(crossbeam_channel::Sender<T>),
     Tk(mpsc::UnboundedSender<T>),
     Fl(flume::Sender<T>),
@@ -263,7 +271,11 @@ impl<T: Stamp> Tx<T> {
             Tx::KA(s) => s.as_sync().send(v).is_ok(),
             Tx::KS(s) => s.send(v).is_ok(),
             Tx::KA2(s) => s.as_sync().send(v).is_ok(),
+            Tx::KANS(s) => s.as_sync().send(v).is_ok(),
+            Tx::KAPL(s) => s.as_sync().send(v).is_ok(),
             Tx::KS2(s) => s.send(v).is_ok(),
+            Tx::KSNS(s) => s.send(v).is_ok(),
+            Tx::KSPL(s) => s.send(v).is_ok(),
             Tx::Cb(s) => s.send(v).is_ok(),
             Tx::Tk(s) => s.send(v).is_ok(),
             Tx::Fl(s) => s.send(v).is_ok(),
@@ -282,6 +294,8 @@ impl<T: Stamp> Tx<T> {
         match self {
             Tx::KA(s) => s.send(v).await.is_ok(),
             Tx::KA2(s) => s.send(v).await.is_ok(),
+            Tx::KANS(s) => s.send(v).await.is_ok(),
+            Tx::KAPL(s) => s.send(v).await.is_ok(),
             _ => self.send_sync(v),
         }
     }
@@ -291,7 +305,11 @@ enum Rx<T> {
     KA(kanal::AsyncReceiver<T>),
     KS(kanal::Receiver<T>),
     KA2(kanal_std::AsyncReceiver<T>),
+    KANS(kanal_ns::AsyncReceiver<T>),
+    KAPL(kanal_pl::AsyncReceiver<T>),
     KS2(kanal_std::Receiver<T>),
+    KSNS(kanal_ns::Receiver<T>),
+    KSPL(kanal_pl::Receiver<T>),
     Cb(crossbeam_channel::Receiver<T>),
     Tk(mpsc::UnboundedReceiver<T>),
     Fl(flume::Receiver<T>),
@@ -311,6 +329,8 @@ impl<T: Stamp> Rx<T> {
         match self {
             Rx::KA(r) => Rx::KS(r.clone_sync()),
             Rx::KA2(r) => Rx::KS2(r.clone_sync()),
+            Rx::KANS(r) => Rx::KSNS(r.clone_sync()),
+            Rx::KAPL(r) => Rx::KSPL(r.clone_sync()),
             other => other,
         }
     }
@@ -321,7 +341,11 @@ impl<T: Stamp> Rx<T> {
             Rx::KA(r) => Rx::KA(r.clone()),
             Rx::KS(r) => Rx::KS(r.clone()),
             Rx::KA2(r) => Rx::KA2(r.clone()),
+            Rx::KANS(r) => Rx::KANS(r.clone()),
+            Rx::KAPL(r) => Rx::KAPL(r.clone()),
             Rx::KS2(r) => Rx::KS2(r.clone()),
+            Rx::KSNS(r) => Rx::KSNS(r.clone()),
+            Rx::KSPL(r) => Rx::KSPL(r.clone()),
             Rx::Cb(r) => Rx::Cb(r.clone()),
             Rx::Fl(r) => Rx::Fl(r.clone()),
             Rx::Ac(r) => Rx::Ac(r.clone()),
@@ -351,9 +375,29 @@ impl<T: Stamp> Rx<T> {
                 Err(kanal_std::ReceiveErrorTimeout::Timeout) => R::Timeout,
                 Err(_) => R::Closed,
             },
+            Rx::KSNS(r) => match r.recv_timeout(d) {
+                Ok(v) => R::Msg(v),
+                Err(kanal_ns::ReceiveErrorTimeout::Timeout) => R::Timeout,
+                Err(_) => R::Closed,
+            },
+            Rx::KSPL(r) => match r.recv_timeout(d) {
+                Ok(v) => R::Msg(v),
+                Err(kanal_pl::ReceiveErrorTimeout::Timeout) => R::Timeout,
+                Err(_) => R::Closed,
+            },
             Rx::KA2(r) => match r.as_sync().recv_timeout(d) {
                 Ok(v) => R::Msg(v),
                 Err(kanal_std::ReceiveErrorTimeout::Timeout) => R::Timeout,
+                Err(_) => R::Closed,
+            },
+            Rx::KANS(r) => match r.as_sync().recv_timeout(d) {
+                Ok(v) => R::Msg(v),
+                Err(kanal_ns::ReceiveErrorTimeout::Timeout) => R::Timeout,
+                Err(_) => R::Closed,
+            },
+            Rx::KAPL(r) => match r.as_sync().recv_timeout(d) {
+                Ok(v) => R::Msg(v),
+                Err(kanal_pl::ReceiveErrorTimeout::Timeout) => R::Timeout,
                 Err(_) => R::Closed,
             },
             Rx::Cb(r) => match r.recv_timeout(d) {
@@ -390,6 +434,8 @@ impl<T: Stamp> Rx<T> {
         match self {
             Rx::KA(r) => r.recv().await.ok(),
             Rx::KA2(r) => r.recv().await.ok(),
+            Rx::KANS(r) => r.recv().await.ok(),
+            Rx::KAPL(r) => r.recv().await.ok(),
             Rx::Tk(r) => r.recv().await,
             Rx::Fl(r) => r.recv_async().await.ok(),
             Rx::Ac(r) => r.recv().await.ok(),
@@ -402,7 +448,7 @@ impl<T: Stamp> Rx<T> {
                     Err(_) => return None,
                 }
             },
-            Rx::KS(_) | Rx::KS2(_) | Rx::Cb(_) => panic!("sync-only receiver used from async"),
+            Rx::KS(_) | Rx::KS2(_) | Rx::KSNS(_) | Rx::KSPL(_) | Rx::Cb(_) => panic!("sync-only receiver used from async"),
         }
     }
 }
@@ -417,6 +463,14 @@ fn route<T: Stamp>(lib: Lib) -> (Tx<T>, Rx<T>) {
         Lib::KanalStd => {
             let (s, r) = kanal_std::unbounded_async();
             (Tx::KA2(s), Rx::KA2(r))
+        }
+        Lib::KanalNs => {
+            let (s, r) = kanal_ns::unbounded_async();
+            (Tx::KANS(s), Rx::KANS(r))
+        }
+        Lib::KanalPl => {
+            let (s, r) = kanal_pl::unbounded_async();
+            (Tx::KAPL(s), Rx::KAPL(r))
         }
         Lib::Crossbeam | Lib::CbBridge => {
             let (s, r) = crossbeam_channel::unbounded();
@@ -452,6 +506,14 @@ fn cthread<T: Stamp>(lib: Lib) -> (Tx<T>, Rx<T>) {
         Lib::KanalStd => {
             let (s, r) = kanal_std::unbounded();
             (Tx::KS2(s), Rx::KA2(r.as_async().clone()))
+        }
+        Lib::KanalNs => {
+            let (s, r) = kanal_ns::unbounded();
+            (Tx::KSNS(s), Rx::KANS(r.as_async().clone()))
+        }
+        Lib::KanalPl => {
+            let (s, r) = kanal_pl::unbounded();
+            (Tx::KSPL(s), Rx::KAPL(r.as_async().clone()))
         }
         other => route(other),
     }
@@ -799,6 +861,8 @@ struct PathDef {
 /// built with the bench feature `std-mutex`)
 const KANAL: &str = if cfg!(feature = "std-mutex") { "kanal(std-mutex build)" } else { "kanal-spin" };
 const KANAL_STD: &str = "kanal-std-mutex";
+const KANAL_NS: &str = "kanal-nosleep";
+const KANAL_PL: &str = "kanal-parking-lot";
 
 fn paths() -> Vec<PathDef> {
     use Lib::*;
@@ -807,7 +871,7 @@ fn paths() -> Vec<PathDef> {
             id: "P1",
             title: "market data -> Python callback thread",
             shape: "tokio dispatcher task `send().await` -> unbounded -> OS thread `clone_sync().recv_timeout(100ms)`; ChannelBidAskSTKv1 616 B",
-            variants: vec![(KANAL, Kanal), (KANAL_STD, KanalStd), ("crossbeam", Crossbeam), ("flume", Flume), ("async-channel", AsyncChan)],
+            variants: vec![(KANAL, Kanal), (KANAL_STD, KanalStd), (KANAL_NS, KanalNs), (KANAL_PL, KanalPl), ("crossbeam", Crossbeam), ("flume", Flume), ("async-channel", AsyncChan)],
             run: p1,
             low_rate: false,
             idle: true,
@@ -816,7 +880,7 @@ fn paths() -> Vec<PathDef> {
             id: "P2",
             title: "market data -> HTTP server SSE",
             shape: "dispatcher task -> unbounded -> forwarding task `recv().await` -> to_standard (392 B) -> tokio broadcast(1000) -> 2 SSE subscriber tasks; 616 B",
-            variants: vec![(KANAL, Kanal), (KANAL_STD, KanalStd), ("tokio mpsc", Tokio), ("flume", Flume), ("async-channel", AsyncChan)],
+            variants: vec![(KANAL, Kanal), (KANAL_STD, KanalStd), (KANAL_NS, KanalNs), (KANAL_PL, KanalPl), ("tokio mpsc", Tokio), ("flume", Flume), ("async-channel", AsyncChan)],
             run: p2,
             low_rate: false,
             idle: false,
@@ -825,7 +889,7 @@ fn paths() -> Vec<PathDef> {
             id: "P3",
             title: "Solace C thread -> dispatcher task",
             shape: "rsolace C callback OS thread sync `send` -> unbounded -> tokio dispatcher `recv().await` (msg / p2p channels); SolMsg 24 B",
-            variants: vec![(KANAL, Kanal), (KANAL_STD, KanalStd), ("tokio mpsc", Tokio), ("flume", Flume), ("async-channel", AsyncChan)],
+            variants: vec![(KANAL, Kanal), (KANAL_STD, KanalStd), (KANAL_NS, KanalNs), (KANAL_PL, KanalPl), ("tokio mpsc", Tokio), ("flume", Flume), ("async-channel", AsyncChan)],
             run: p3,
             low_rate: false,
             idle: false,
@@ -834,7 +898,7 @@ fn paths() -> Vec<PathDef> {
             id: "P4",
             title: "Solace session events -> Python event thread",
             shape: "C callback OS thread `send` -> unbounded -> OS thread `as_async().clone_sync().recv_timeout(100ms)`; SolEvent 48 B (rare events)",
-            variants: vec![(KANAL, Kanal), (KANAL_STD, KanalStd), ("crossbeam", Crossbeam), ("flume", Flume), ("async-channel", AsyncChan)],
+            variants: vec![(KANAL, Kanal), (KANAL_STD, KanalStd), (KANAL_NS, KanalNs), (KANAL_PL, KanalPl), ("crossbeam", Crossbeam), ("flume", Flume), ("async-channel", AsyncChan)],
             run: p4,
             low_rate: true,
             idle: true,
@@ -843,7 +907,7 @@ fn paths() -> Vec<PathDef> {
             id: "P6",
             title: "multi-route fan-out (full chain)",
             shape: "C thread SolMsg -> dispatcher task -> 8 unbounded routes (bidask/tick stk+fop, quote stk/fop/idx, order; 392-1104 B, weighted 40/25/15/10/4/2/2/2) -> 8 OS threads recv_timeout(100ms)",
-            variants: vec![(KANAL, Kanal), (KANAL_STD, KanalStd), ("crossbeam+tokio", Crossbeam), ("flume", Flume), ("async-channel", AsyncChan)],
+            variants: vec![(KANAL, Kanal), (KANAL_STD, KanalStd), (KANAL_NS, KanalNs), (KANAL_PL, KanalPl), ("crossbeam+tokio", Crossbeam), ("flume", Flume), ("async-channel", AsyncChan)],
             run: p6,
             low_rate: false,
             idle: true,
@@ -854,7 +918,7 @@ fn paths() -> Vec<PathDef> {
             shape: "dispatcher task -> one channel -> competing consumers: OS thread recv_timeout(100ms) + tokio task `recv().await`; 616 B",
             variants: vec![
                 (KANAL, Kanal),
-                (KANAL_STD, KanalStd),
+                (KANAL_STD, KanalStd), (KANAL_NS, KanalNs), (KANAL_PL, KanalPl),
                 ("flume", Flume),
                 ("async-channel", AsyncChan),
                 ("crossbeam+bridge->tokio", CbBridge),
@@ -1173,10 +1237,14 @@ fn main() {
     let mut defs = paths();
     for p in &mut defs {
         if kanal_only {
-            p.variants.retain(|(_, l)| matches!(l, Lib::Kanal | Lib::KanalStd));
+            p.variants.retain(|(_, l)| matches!(l, Lib::Kanal | Lib::KanalStd | Lib::KanalNs | Lib::KanalPl));
         }
         if reverse {
             p.variants.reverse();
+        }
+        if let Some(n) = get("--rotate").map(|s| s.parse::<usize>().unwrap()) {
+            let len = p.variants.len();
+            p.variants.rotate_left(n % len);
         }
     }
     let wanted = group_paths(&group);

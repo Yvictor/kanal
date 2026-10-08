@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Compare kanal-spin vs kanal-std-mutex from channel-compare-shioaji JSON
-results (run with --kanal-only). Usage: compare_mutex.py DIR [DIR...]
+"""Compare kanal lock variants against kanal-spin from channel-compare-shioaji
+JSON results (run with --kanal-only). Usage: compare_mutex.py DIR [DIR...]
 
+Variants: spin (baseline), std = std-mutex, ns = nosleep spin, pl = parking_lot.
 Repetitions of the same os/group/load are pooled: latency percentiles and
 CPU are averaged, max is the worst, threshold counts and seconds>1ms are
 summed, throughput is the mean of the per-rep flood medians.
-Flags (std vs spin): p50 > +10% and > +1 µs, p99.9 > +25% and > +20 µs,
-max > +25% and > +500 µs, >1ms count higher, secs>1ms higher, throughput
-< 0.9x, CPU/msg > +15%.
+Flags (candidate vs spin): p50 > +10% and > +1 µs, p99.9 > +25% and > +20 µs,
+max > +25% and > +500 µs, >1ms count > +5%, secs>1ms higher,
+throughput < 0.9x, CPU/msg > +15% and > +0.5 µs.
 """
 import json
 import pathlib
@@ -15,17 +16,20 @@ import statistics
 import sys
 from collections import defaultdict
 
-SPIN, STD = "kanal-spin", "kanal-std-mutex"
+BASE = "kanal-spin"
+CANDS = [("kanal-std-mutex", "std"), ("kanal-nosleep", "ns"), ("kanal-parking-lot", "pl")]
 SCEN = [("long_10k", "10k/s"), ("bursty", "bursty"), ("paced_100", "100/s")]
 
 
 def load(dirs):
-    runs = defaultdict(list)  # (os, load, path, scen) -> [(variant-> dict)]
-    thr = defaultdict(lambda: defaultdict(list))  # (os, load, path) -> variant -> [mps]
+    runs = defaultdict(list)
+    thr = defaultdict(lambda: defaultdict(list))
     idle = defaultdict(lambda: defaultdict(list))
     files = 0
     for d in dirs:
         for f in sorted(pathlib.Path(d).rglob("*.json")):
+            if f.name.startswith("compare"):
+                continue
             rep = json.loads(f.read_text())
             if "paths" not in rep:
                 continue
@@ -33,7 +37,7 @@ def load(dirs):
             ld = "contended" if rep["contended"] else "normal"
             for p in rep["paths"]:
                 vs = {v["label"]: v for v in p["variants"]}
-                if SPIN not in vs or STD not in vs:
+                if BASE not in vs:
                     continue
                 key = (rep["os"], ld, p["id"])
                 for lab, v in vs.items():
@@ -41,8 +45,8 @@ def load(dirs):
                     if v.get("idle"):
                         idle[key][lab].append(v["idle"]["cpu_pct"])
                 for sk, _ in SCEN:
-                    if vs[SPIN].get(sk):
-                        runs[key + (sk,)].append({lab: vs[lab][sk] for lab in (SPIN, STD)})
+                    if vs[BASE].get(sk):
+                        runs[key + (sk,)].append({lab: v[sk] for lab, v in vs.items()})
     return runs, thr, idle, files
 
 
@@ -54,15 +58,16 @@ def agg(rs):
         "p50": m("p50"),
         "p99": m("p99"),
         "p999": m("p999"),
-        "p9999": m("p9999"),
         "max": max(x["max"] for x in lat),
-        "stdev": m("stdev"),
-        "o100": sum(x["over_100us"] for x in lat),
         "o1": sum(x["over_1ms"] for x in lat),
         "o10": sum(x["over_10ms"] for x in lat),
         "s1": sum(x["secs_max_over_1ms"] for x in lat),
         "secs": sum(x["secs"] for x in lat),
         "cpu": statistics.mean(r["cpu_ns_per_msg"] for r in rs) / 1000.0,
+        "reps_p50": [x["p50"] for x in lat],
+        "reps_p999": [x["p999"] for x in lat],
+        "reps_max": [x["max"] for x in lat],
+        "reps_o1": [x["over_1ms"] for x in lat],
     }
 
 
@@ -74,7 +79,7 @@ def flags(a, b, ta, tb):
         f.append("p99.9")
     if b["max"] > a["max"] * 1.25 and b["max"] - a["max"] > 500:
         f.append("max")
-    if b["o1"] > a["o1"]:
+    if b["o1"] > a["o1"] * 1.05:
         f.append(">1ms")
     if b["s1"] > a["s1"]:
         f.append("s>1ms")
@@ -91,30 +96,36 @@ def fm(x):
 
 def main():
     runs, thr, idle, files = load(sys.argv[1:] or ["results"])
-    out = [f"# kanal spin vs std-mutex ({files} result files)\n", __doc__.split("\n\n", 1)[1], ""]
+    present = [(l, s) for l, s in CANDS if any(l in r for rs in runs.values() for r in rs)]
+    labs = [BASE] + [l for l, _ in present]
+    hdr = "spin/" + "/".join(s for _, s in present)
+    out = [f"# kanal lock variants vs spin ({files} result files)\n", __doc__.split("\n\n", 1)[1], ""]
     summary = []
     for os_ in sorted({k[0] for k in runs}):
-        out.append(f"\n## {os_}\n")
-        out.append("| load | path | scen | reps | p50 spin/std µs | p99 | p99.9 | p99.99 | max | >100µs | >1ms | >10ms | secs>1ms | CPU µs/msg | flood Mmsg/s | idle CPU% | std worse |")
-        out.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        out.append(f"\n## {os_}\n\nvalues are {hdr}\n")
+        out.append("| load | path | scen | reps | p50 µs | p99 | p99.9 | max | >1ms | >10ms | secs>1ms | CPU µs/msg | flood Mmsg/s | idle CPU% | "
+                   + " | ".join(f"{s} worse" for _, s in present) + " |")
+        out.append("|" + "---|" * (14 + len(present)))
         for k in sorted(k for k in runs if k[0] == os_):
             _, ld, path, sk = k
-            a = agg([r[SPIN] for r in runs[k]])
-            b = agg([r[STD] for r in runs[k]])
+            A = {l: agg([r[l] for r in runs[k] if l in r]) for l in labs}
             t = thr[(os_, ld, path)]
-            ta, tb = statistics.mean(t[SPIN]) / 1e6, statistics.mean(t[STD]) / 1e6
+            T = {l: statistics.mean(t[l]) / 1e6 for l in labs}
             i = idle[(os_, ld, path)]
-            idl = f"{statistics.mean(i[SPIN]):.2f}/{statistics.mean(i[STD]):.2f}" if i.get(SPIN) else "-"
-            fl = flags(a, b, ta, tb)
-            sn = dict(SCEN)[sk]
+            idl = "/".join(f"{statistics.mean(i[l]):.2f}" for l in labs) if i.get(BASE) else "-"
+            j = lambda key, fmt=fm: "/".join(fmt(A[l][key]) for l in labs)
+            fl = {s: flags(A[BASE], A[l], T[BASE], T[l]) for l, s in present}
             out.append(
-                f"| {ld} | {path} | {sn} | {a['n']} | {fm(a['p50'])}/{fm(b['p50'])} | {fm(a['p99'])}/{fm(b['p99'])} | "
-                f"{fm(a['p999'])}/{fm(b['p999'])} | {fm(a['p9999'])}/{fm(b['p9999'])} | {fm(a['max'])}/{fm(b['max'])} | "
-                f"{a['o100']}/{b['o100']} | {a['o1']}/{b['o1']} | {a['o10']}/{b['o10']} | {a['s1']}/{b['s1']} (of {a['secs']}) | "
-                f"{a['cpu']:.2f}/{b['cpu']:.2f} | {ta:.2f}/{tb:.2f} | {idl} | {' '.join(fl) or 'no'} |"
+                f"| {ld} | {path} | {dict(SCEN)[sk]} | {A[BASE]['n']} | {j('p50')} | {j('p99')} | {j('p999')} | {j('max')} | "
+                f"{j('o1', str)} | {j('o10', str)} | {j('s1', str)} (of {A[BASE]['secs']}) | {j('cpu', lambda x: f'{x:.2f}')} | "
+                + "/".join(f"{T[l]:.2f}" for l in labs)
+                + f" | {idl} | "
+                + " | ".join(" ".join(fl[s]) or "no" for _, s in present)
+                + " |"
             )
-            summary.append({"os": os_, "load": ld, "path": path, "scen": sn, "spin": a, "std": b,
-                            "thr_spin": ta, "thr_std": tb, "flags": fl})
+            summary.append({"os": os_, "load": ld, "path": path, "scen": dict(SCEN)[sk],
+                            "agg": A, "thr": T, "flags": fl,
+                            "thr_reps": {l: [x / 1e6 for x in t[l]] for l in labs}})
     print("\n".join(out))
     pathlib.Path("compare_summary.json").write_text(json.dumps(summary, indent=1))
 
