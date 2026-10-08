@@ -1,0 +1,77 @@
+name: kanal spin mutex vs std-mutex (shioaji paths)
+
+# Same kanal sources twice in one binary: `kanal` (own spin mutex, default)
+# and `kanal_std` (feature std-mutex), interleaved per scenario. Every group in
+# normal and contended mode, 2 repetitions (the 2nd runs the variants in
+# reverse order).
+
+on:
+  push:
+    branches: [bench/channel-compare]
+    paths:
+      - "channel-compare-shioaji/**"
+      - ".github/workflows/kanal-mutex-compare.yml"
+      - "src/**"
+  workflow_dispatch:
+    inputs:
+      long_secs:
+        description: "seconds of the long paced 10k msg/s run per variant (bursty runs half of it)"
+        default: "60"
+
+jobs:
+  bench:
+    name: ${{ matrix.os }} ${{ matrix.group }} ${{ matrix.load }} rep${{ matrix.rep }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # A1: P1+P4, A2: P7 (MPMC), B: P2+P3, C: P6 (multi-route)
+        group: [A1, A2, B, C]
+        load: [normal, contended]
+        rep: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        working-directory: channel-compare-shioaji
+        run: cargo build --release
+      - name: Run
+        working-directory: channel-compare-shioaji
+        shell: bash
+        run: |
+          FLAGS="--kanal-only --group ${{ matrix.group }} --long-secs ${{ inputs.long_secs || '60' }} --out results --tag rep${{ matrix.rep }}"
+          if [ "${{ matrix.load }}" = "contended" ]; then FLAGS="$FLAGS --contend"; fi
+          if [ "${{ matrix.rep }}" = "2" ]; then FLAGS="$FLAGS --reverse"; fi
+          cargo run --release -q -- $FLAGS > summary.md 2> log.txt || { cat log.txt; exit 1; }
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          cp log.txt results/log-${{ matrix.group }}-${{ matrix.load }}-rep${{ matrix.rep }}.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutex-${{ matrix.os }}-${{ matrix.group }}-${{ matrix.load }}-rep${{ matrix.rep }}
+          path: channel-compare-shioaji/results/
+
+  compare:
+    needs: bench
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mutex-*
+          path: all
+          merge-multiple: true
+      - name: Compare spin vs std-mutex
+        run: |
+          python3 channel-compare-shioaji/compare_mutex.py all > compare.md
+          cat compare.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mutex-compare
+          path: |
+            compare.md
+            compare_summary.json
+            all/

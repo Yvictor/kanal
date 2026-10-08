@@ -1,0 +1,22 @@
+# Second copy of the *same* kanal sources (../../src) built with the
+# `std-mutex` feature, under another crate name, so one benchmark binary can
+# interleave kanal's own spin mutex and std::sync::Mutex in the same process.
+[package]
+name = "kanal-std-mutex"
+version = "0.1.3"
+edition = "2021"
+publish = false
+
+[lib]
+name = "kanal_std"
+path = "../../src/lib.rs"
+
+[dependencies]
+cacheguard = "0.1"
+futures-core = { version = "0.3", optional = true }
+lock_api = "0.4"
+
+[features]
+async = ["futures-core"]
+std-mutex = []
+default = ["async", "std-mutex"]

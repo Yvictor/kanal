@@ -1,12 +1,9 @@
 name: Channel comparison, shioaji paths (kanal vs crossbeam/tokio/flume/async-channel)
 
+# Manual only: pushes to channel-compare-shioaji/ now run the kanal spin vs
+# std-mutex comparison (kanal-mutex-compare.yml) and should not compete with
+# this 5-library run for runners.
 on:
-  push:
-    branches: [bench/channel-compare]
-    paths:
-      - "channel-compare-shioaji/**"
-      - ".github/workflows/channel-compare-shioaji.yml"
-      - "src/**"
   workflow_dispatch:
     inputs:
       long_secs:

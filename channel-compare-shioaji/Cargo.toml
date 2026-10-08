@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 kanal = { path = ".." }
+# same kanal sources with std::sync::Mutex (feature std-mutex), see kanal-std-mutex/
+kanal_std = { package = "kanal-std-mutex", path = "kanal-std-mutex" }
 crossbeam-channel = "0.5"
 flume = "0.11"
 async-channel = "2"
@@ -17,6 +19,11 @@ hdrhistogram = { version = "7", default-features = false }
 cpu-time = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[features]
+# Build the plain `kanal` variant with std::sync::Mutex as well (single-variant
+# builds; the in-process comparison uses the kanal_std crate instead).
+std-mutex = ["kanal/std-mutex"]
 
 [profile.release]
 codegen-units = 1
